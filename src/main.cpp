@@ -4,9 +4,17 @@
 #include <WiFiClientSecure.h>
 #include "secrets.h"
 #include "cert.h"
+#include <PubSubClient.h>
 
-const char *url = "https://jsonplaceholder.typicode.com/todos/1";
-const char *shellyUrl = "http://192.168.0.124/relay/0?turn=toggle";
+const char* MQTT_SERVER = "broker.hivemq.com";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_TOPIC_SUB = "demo/home/lamp1/cmd";
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+const char url[] = "https://jsonplaceholder.typicode.com/todos/1";
+const char shellyUrl[] = "http://192.168.0.124/relay/0?turn=toggle";
 
 void toggleShelly()
 {
@@ -30,36 +38,110 @@ void toggleShelly()
     Serial.println("WLAN nicht verbunden, kann Shelly nicht schalten");
   }
 }
-void setup()
+
+void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
-  Serial.begin(115200);
-  delay(2000);
+  Serial.print("MQTT-Nachricht auf Topic: ");
+  Serial.println(topic);
 
-  Serial.println("Verbinde mit WLAN...");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED)
+  String msg;
+  for (unsigned int i = 0; i < length; i++)
   {
-    delay(500);
-    Serial.print(".");
+    msg += (char)payload[i];
   }
-  Serial.println("\nWLAN verbunden!");
-  Serial.println(WiFi.localIP());
-
-  pinMode(LED_BUILTIN, OUTPUT);
+  msg.trim();
+  Serial.print("Payload: ");
+  Serial.println(msg);
+  toggleShelly();
 }
 
-void loop()
+void setupMqtt()
 {
-  //toggleShelly();
-  static bool state = false;
-  state = !state;
-  digitalWrite(LED_BUILTIN, state ? HIGH : LOW);
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
 
+  while (!mqttClient.connected())
+  {
+    Serial.print("Verbinde mit MQTT-Broker ... ");
+    String clientId = "esp32-client-";
+    clientId += String(WiFi.macAddress());
+
+    if (mqttClient.connect(clientId.c_str()))
+    {
+      Serial.println("verbunden");
+      mqttClient.subscribe(MQTT_TOPIC_SUB);
+      Serial.print("Subscribed auf: ");
+      Serial.println(MQTT_TOPIC_SUB);
+    }
+    else
+    {
+      Serial.print("fehlgeschlagen, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" -> neuer Versuch in 5s");
+      delay(5000);
+    }
+  }
+}
+
+void handleMqtt() {
+  if (!mqttClient.connected()) {
+    setupMqtt();   // neu verbinden, falls getrennt
+  }
+  mqttClient.loop();  // muss regelmäßig aufgerufen werden
+}
+
+void getSmhDevices()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("WLAN nicht verbunden");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setCACert(ROOT_CERT_SMARTVITAAPI);
+
+  HTTPClient https;
+
+  String url = "https://api.smart-vita.de/services/2.0/smh-devices";
+
+  if (!https.begin(client, url))
+  {
+    Serial.println("HTTPS begin() fehlgeschlagen");
+    return;
+  }
+
+  // Authorization-Header mit Bearer-Token
+  String authHeader = String("Bearer ") + ACCESS_TOKEN;
+  https.addHeader("Authorization", authHeader);
+
+  int httpCode = https.GET();
+
+  Serial.print("HTTP-Code: ");
+  Serial.println(httpCode);
+
+  if (httpCode > 0)
+  {
+    String payload = https.getString();
+    Serial.println("Antwort von /smh-devices:");
+    Serial.println(payload);
+  }
+  else
+  {
+    Serial.print("HTTPS-Fehler: ");
+    Serial.println(httpCode);
+  }
+
+  https.end();
+}
+
+void request_jsonplaceholder()
+{
   if (WiFi.status() == WL_CONNECTED)
   {
     WiFiClientSecure client;
-    //client.setInsecure(); // *** UNSICHER, nur für Tests ***
-    client.setCACert(ROOT_CERT);
+    // client.setInsecure(); // *** UNSICHER, nur für Tests ***
+    client.setCACert(ROOT_CERT_JSONPLACEHOLDER);
 
     HTTPClient https;
     if (https.begin(client, url))
@@ -90,6 +172,34 @@ void loop()
   {
     Serial.println("WLAN nicht verbunden");
   }
+}
 
-  delay(10000);
+void setup()
+{
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("Verbinde mit WLAN...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWLAN verbunden!");
+  Serial.println(WiFi.localIP());
+  setupMqtt();
+  // pinMode(LED_BUILTIN, OUTPUT);
+}
+
+void loop()
+{
+  // Serial.println("\nTEST!");
+  //  toggleShelly();
+  // request_jsonplaceholder();
+  // getSmhDevices();
+  //  static bool state = false;
+  //  state = !state;
+  //  digitalWrite(LED_BUILTIN, state ? HIGH : LOW);
+  handleMqtt();
+  delay(10);
 }
