@@ -2,80 +2,333 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <memory>
+
+// Base64 kommt beim ESP32 über mbedTLS
+#include "mbedtls/base64.h"
+
 #include "secrets.h"
 #include "cert.h"
-#include <PubSubClient.h>
 
-const char* MQTT_SERVER = "a5247c1ae5634398b09808b959fd47e9.s1.eu.hivemq.cloud";
-const uint16_t MQTT_PORT = 8883;
-const char* MQTT_TOPIC_SUB = "t/LeoTestID";
+const char *MQTT_SERVER    = "a5247c1ae5634398b09808b959fd47e9.s1.eu.hivemq.cloud";
+const uint16_t MQTT_PORT   = 8883;
+const char *MQTT_TOPIC_SUB = "t/LeoTestID";
 
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 
-const char url[] = "https://jsonplaceholder.typicode.com/todos/1";
-const char shellyUrl[] = "http://192.168.0.124/relay/0?turn=toggle";
+static const uint16_t MQTT_BUFFER_SIZE = 4096;
+static const uint32_t HTTP_TIMEOUT_MS  = 15000;
 
-void toggleShelly()
-{
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    HTTPClient http;
-    http.begin(shellyUrl);
-    int httpCode = http.GET(); // GET-Request an Shelly
+// JSON Speicher (anpassen, wenn du größere Bodies erwartest)
+static const size_t JSON_DOC_SIZE     = 4096;
+static const size_t MAX_BODY_DECODED  = 2048; // Schutz gegen riesige Bodies
 
-    Serial.print("Shelly HTTP-Code: ");
-    Serial.println(httpCode);
+String espId; // z.B. "esp-<mac>"
 
-    String payload = http.getString(); // Antwort (JSON) optional
-    Serial.println("Shelly-Antwort:");
-    Serial.println(payload);
+String pendingMsg;
+bool hasPending = false;
 
-    http.end();
+// ---------- helpers: time ----------
+void syncTimeOrWarn() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  time_t now = time(nullptr);
+  uint32_t start = millis();
+  while (now < 1700000000 && (millis() - start) < 15000) { // ~2023+
+    delay(200);
+    now = time(nullptr);
   }
-  else
-  {
-    Serial.println("WLAN nicht verbunden, kann Shelly nicht schalten");
+
+  if (now < 1700000000) {
+    Serial.println("WARN: NTP Zeit nicht gesetzt -> TLS Zertifikatsprüfung kann scheitern.");
+  } else {
+    Serial.println("Zeit via NTP gesetzt.");
   }
 }
 
-void mqttCallback(char *topic, byte *payload, unsigned int length)
-{
-  Serial.print("MQTT-Nachricht auf Topic: ");
-  Serial.println(topic);
+// ---------- helpers: base64 ----------
+bool b64DecodeToString(const char *in, String &out, size_t maxOut) {
+  out = "";
+  if (!in) return true;
+  size_t inLen = strlen(in);
+  if (inLen == 0) return true;
 
+  size_t bufLen = (inLen * 3) / 4 + 8;
+  if (bufLen > maxOut) return false;
+
+  std::unique_ptr<uint8_t[]> buf(new uint8_t[bufLen]);
+  size_t outLen = 0;
+
+  int rc = mbedtls_base64_decode(buf.get(), bufLen, &outLen,
+                                 (const unsigned char *)in, inLen);
+  if (rc != 0) return false;
+
+  out.reserve(outLen);
+  for (size_t i = 0; i < outLen; i++) out += (char)buf[i];
+  return true;
+}
+
+String b64Encode(const uint8_t *data, size_t len) {
+  if (!data || len == 0) return "";
+  size_t outLen = 0;
+  size_t bufLen = 4 * ((len + 2) / 3) + 1;
+
+  std::unique_ptr<uint8_t[]> buf(new uint8_t[bufLen]);
+  int rc = mbedtls_base64_encode(buf.get(), bufLen, &outLen, data, len);
+  if (rc != 0) return "";
+
+  return String((char *)buf.get()).substring(0, outLen);
+}
+
+// ---------- helpers: publish ----------
+void publishJson(const JsonDocument &doc) {
+  String out;
+  serializeJson(doc, out);
+  mqttClient.publish(MQTT_TOPIC_SUB, out.c_str());
+}
+
+void publishError(const char *reqId, const char *err, int status = -1) {
+  StaticJsonDocument<768> res;
+  res["v"] = 1;
+  res["type"] = "res";
+  res["id"] = reqId ? reqId : "";
+  res["from"] = espId;
+  res["ok"] = false;
+  res["status"] = status;
+  res["error"] = err ? err : "error";
+  res["body_b64"] = "";
+  publishJson(res);
+}
+
+// ---------- allowlist (Sicherheit) ----------
+bool isUrlAllowed(const String &url) {
+  if (!url.startsWith("http://")) return false;
+  if (url.startsWith("http://192.168.")) return true;
+  if (url.startsWith("http://10.")) return true;
+  return false;
+}
+
+// ---------- HTTP execute ----------
+bool doHttpRequest(JsonObjectConst http, int &statusOut, String &respOut) {
+  Serial.println("---- doHttpRequest ----");
+
+  statusOut = -1;
+  respOut = "";
+
+  const char *method = http["method"] | "";
+  const char *urlC   = http["url"]    | "";
+  const char *bodyB64 = http["body_b64"] | "";
+
+  Serial.print("method="); Serial.println(method);
+  Serial.print("url="); Serial.println(urlC);
+
+  if (method[0] == '\0' || urlC[0] == '\0') {
+    respOut = "Missing method/url";
+    return false;
+  }
+
+  String url(urlC);
+  if (!isUrlAllowed(url)) {
+    respOut = "URL not allowed";
+    return false;
+  }
+
+  String body;
+  if (!b64DecodeToString(bodyB64, body, MAX_BODY_DECODED)) {
+    respOut = "Body base64 decode failed/too large";
+    return false;
+  }
+
+  HTTPClient client;
+  client.setTimeout(HTTP_TIMEOUT_MS);
+
+  WiFiClient net; // unverschlüsseltes HTTP im LAN
+  if (!client.begin(net, url)) {
+    respOut = "HTTP begin() failed";
+    return false;
+  }
+  Serial.println("HTTP begin OK");
+
+  // optionale Header
+  if (http["headers"].is<JsonObjectConst>()) {
+    JsonObjectConst headersObj = http["headers"].as<JsonObjectConst>();
+    for (JsonPairConst kv : headersObj) {
+      const char *k = kv.key().c_str();
+      const char *v = kv.value().as<const char *>();
+      if (k && v) client.addHeader(k, v);
+    }
+  }
+
+  String m(method);
+  m.toUpperCase();
+
+  int code = -1;
+  String bodyResp;
+
+  if (m == "GET") {
+    Serial.print("HTTP -> "); Serial.println(url);
+    code = client.GET();
+    bodyResp = client.getString();
+  } else if (m == "POST") {
+    bool hasHeaders = http["headers"].is<JsonObjectConst>();
+    JsonObjectConst headersObj = hasHeaders ? http["headers"].as<JsonObjectConst>() : JsonObjectConst();
+    if (!hasHeaders || !headersObj.containsKey("Content-Type")) {
+      client.addHeader("Content-Type", "application/json");
+    }
+    code = client.POST((uint8_t *)body.c_str(), body.length());
+    bodyResp = client.getString();
+  } else if (m == "PUT") {
+    bool hasHeaders = http["headers"].is<JsonObjectConst>();
+    JsonObjectConst headersObj = hasHeaders ? http["headers"].as<JsonObjectConst>() : JsonObjectConst();
+    if (!hasHeaders || !headersObj.containsKey("Content-Type")) {
+      client.addHeader("Content-Type", "application/json");
+    }
+    code = client.PUT((uint8_t *)body.c_str(), body.length());
+    bodyResp = client.getString();
+  } else if (m == "DELETE") {
+    code = client.sendRequest("DELETE", (uint8_t *)body.c_str(), body.length());
+    bodyResp = client.getString();
+  } else {
+    client.end();
+    respOut = "Unsupported HTTP method";
+    return false;
+  }
+
+  Serial.print("HTTP code: "); Serial.println(code);
+  Serial.print("HTTP resp len: "); Serial.println(bodyResp.length());
+  Serial.println(bodyResp);
+
+  statusOut = code;
+  respOut = bodyResp;
+
+  client.end();
+  return (code > 0);
+}
+
+// ---------- MQTT request handler ----------
+void handleReq(const JsonDocument &req) {
+  Serial.println("==== handleReq ====");
+
+  JsonObjectConst root = req.as<JsonObjectConst>();
+  if (root.isNull()) {
+    Serial.println("Abort: root is not an object");
+    return;
+  }
+
+  const char *id = root["id"] | "";
+  Serial.print("id="); Serial.println(id);
+  if (id[0] == '\0') {
+    Serial.println("Abort: missing id");
+    return;
+  }
+
+  if (!root["http"].is<JsonObjectConst>()) {
+    Serial.println("Abort: missing http object");
+    publishError(id, "Missing http object");
+    return;
+  }
+
+  JsonObjectConst httpObj = root["http"].as<JsonObjectConst>();
+
+  const char *method = httpObj["method"] | "";
+  const char *urlC   = httpObj["url"]    | "";
+  Serial.print("method="); Serial.println(method);
+  Serial.print("url="); Serial.println(urlC);
+
+  int httpStatus = -1;
+  String httpBody;
+
+  bool ok = doHttpRequest(httpObj, httpStatus, httpBody);
+
+  Serial.print("doHttpRequest ok="); Serial.print(ok);
+  Serial.print(" status="); Serial.println(httpStatus);
+
+  if (!ok) {
+    publishError(id, httpBody.c_str(), httpStatus);
+    return;
+  }
+
+  DynamicJsonDocument res(JSON_DOC_SIZE);
+  res["v"] = 1;
+  res["type"] = "res";
+  res["id"] = id;
+  res["from"] = espId;
+  res["ok"] = true;
+  res["status"] = httpStatus;
+
+  String bodyB64 = b64Encode((const uint8_t *)httpBody.c_str(), httpBody.length());
+  res["body_b64"] = bodyB64;
+
+  publishJson(res);
+}
+
+// ---------- MQTT callback: nur queue ----------
+void mqttCallback(char *topic, byte *payload, unsigned int length) {
   String msg;
-  for (unsigned int i = 0; i < length; i++)
-  {
-    msg += (char)payload[i];
-  }
+  msg.reserve(length + 1);
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
   msg.trim();
-  Serial.print("Payload: ");
-  Serial.println(msg);
-  toggleShelly();
+
+  Serial.println("---- mqttCallback ----");
+  Serial.print("Topic: "); Serial.println(topic);
+  Serial.print("Len: "); Serial.println(msg.length());
+  Serial.print("Raw: "); Serial.println(msg);
+
+  DynamicJsonDocument doc(JSON_DOC_SIZE);
+  DeserializationError err = deserializeJson(doc, msg);
+  if (err) {
+    Serial.print("JSON parse failed: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  const char *type = doc["type"] | "";
+  const char *from = doc["from"] | "";
+  const char *id   = doc["id"]   | "";
+
+  Serial.print("Parsed type="); Serial.print(type);
+  Serial.print(" from="); Serial.print(from);
+  Serial.print(" id="); Serial.println(id);
+
+  if (strcmp(type, "req") != 0) {
+    Serial.println("Ignore: not a req");
+    return;
+  }
+
+  if (from[0] != '\0' && espId == String(from)) {
+    Serial.println("Ignore: from==espId");
+    return;
+  }
+
+  pendingMsg = msg;
+  hasPending = true;
+  Serial.println("Queued request for loop()");
 }
 
-void setupMqtt()
-{
+// ---------- MQTT setup/loop ----------
+void setupMqtt() {
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
 
-  while (!mqttClient.connected())
-  {
-    Serial.print("Verbinde mit MQTT-Broker ... ");
-    String clientId = "esp32-client-";
-    clientId += String(WiFi.macAddress());
+  bool resized = mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
+  Serial.print("MQTT buffer resized: ");
+  Serial.println(resized ? "OK" : "FAILED");
 
-    // Use MQTT username/password from secrets.h
-    if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD))
-    {
+  while (!mqttClient.connected()) {
+    Serial.print("Verbinde mit MQTT-Broker ... ");
+    String clientId = "esp32c6-";
+    clientId += WiFi.macAddress();
+
+    if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
       Serial.println("verbunden");
       mqttClient.subscribe(MQTT_TOPIC_SUB);
       Serial.print("Subscribed auf: ");
       Serial.println(MQTT_TOPIC_SUB);
-    }
-    else
-    {
+    } else {
       Serial.print("fehlgeschlagen, rc=");
       Serial.print(mqttClient.state());
       Serial.println(" -> neuer Versuch in 5s");
@@ -85,133 +338,59 @@ void setupMqtt()
 }
 
 void handleMqtt() {
-  if (!mqttClient.connected()) {
-    setupMqtt();   // neu verbinden, falls getrennt
-  }
-  mqttClient.loop();  // muss regelmäßig aufgerufen werden
+  if (!mqttClient.connected()) setupMqtt();
+  mqttClient.loop();
 }
 
-void getSmhDevices()
-{
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    Serial.println("WLAN nicht verbunden");
-    return;
-  }
-
-  WiFiClientSecure client;
-  client.setCACert(ROOT_CERT_SMARTVITAAPI);
-
-  HTTPClient https;
-
-  String url = "https://api.smart-vita.de/services/2.0/smh-devices";
-
-  if (!https.begin(client, url))
-  {
-    Serial.println("HTTPS begin() fehlgeschlagen");
-    return;
-  }
-
-  // Authorization-Header mit Bearer-Token
-  String authHeader = String("Bearer ") + ACCESS_TOKEN;
-  https.addHeader("Authorization", authHeader);
-
-  int httpCode = https.GET();
-
-  Serial.print("HTTP-Code: ");
-  Serial.println(httpCode);
-
-  if (httpCode > 0)
-  {
-    String payload = https.getString();
-    Serial.println("Antwort von /smh-devices:");
-    Serial.println(payload);
-  }
-  else
-  {
-    Serial.print("HTTPS-Fehler: ");
-    Serial.println(httpCode);
-  }
-
-  https.end();
-}
-
-void request_jsonplaceholder()
-{
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    WiFiClientSecure client;
-    // client.setInsecure(); // *** UNSICHER, nur für Tests ***
-    client.setCACert(ROOT_CERT_JSONPLACEHOLDER);
-
-    HTTPClient https;
-    if (https.begin(client, url))
-    {
-      int httpCode = https.GET();
-      if (httpCode > 0)
-      {
-        Serial.print("HTTP-Code: ");
-        Serial.println(httpCode);
-
-        String payload = https.getString();
-        Serial.println("Antwort:");
-        Serial.println(payload);
-      }
-      else
-      {
-        Serial.print("HTTPS-Fehler: ");
-        Serial.println(httpCode);
-      }
-      https.end();
-    }
-    else
-    {
-      Serial.println("HTTPS begin() fehlgeschlagen");
-    }
-  }
-  else
-  {
-    Serial.println("WLAN nicht verbunden");
-  }
-}
-
-void setup()
-{
+// ---------- Arduino setup/loop ----------
+void setup() {
   Serial.begin(115200);
   delay(100);
+
+  espId = "esp-";
+  espId += WiFi.macAddress();
+
   Serial.println("Verbinde mit WLAN...");
+  WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED)
-  {
+
+  while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
   Serial.println("\nWLAN verbunden!");
   Serial.println(WiFi.localIP());
 
-  // Configure TLS for MQTT connection. If ROOT_CERT_HIVEMQ is empty,
-  // fall back to insecure connection (useful for quick testing only).
-  if (ROOT_CERT_HIVEMQ[0] != '\0') {
-    espClient.setCACert(ROOT_CERT_HIVEMQ);
-    Serial.println("MQTT: using certificate from cert.h");
-  } else {
-    espClient.setInsecure();
-    Serial.println("MQTT: WARNING - certificate verification DISABLED (setInsecure()).");
-  }
+  syncTimeOrWarn();
+
+  // TLS CA fürs MQTTS
+  espClient.setCACert(ROOT_CERT_HIVEMQ);
 
   setupMqtt();
-  // pinMode(LED_BUILTIN, OUTPUT);
 }
 
-void loop()
-{
-  // Serial.println("\nTEST!");
-  //  toggleShelly();
-  // request_jsonplaceholder();
-  // getSmhDevices();
-  //  static bool state = false;
-  //  state = !state;
-  //  digitalWrite(LED_BUILTIN, state ? HIGH : LOW);
+void loop() {
   handleMqtt();
+
+  if (hasPending) {
+    hasPending = false;
+
+    Serial.println("loop(): processing pendingMsg");
+    Serial.print("pendingMsg len="); Serial.println(pendingMsg.length());
+    Serial.print("pendingMsg raw="); Serial.println(pendingMsg);
+
+    DynamicJsonDocument doc(JSON_DOC_SIZE);
+    DeserializationError err = deserializeJson(doc, pendingMsg);
+
+    Serial.print("loop(): deserialize err=");
+    Serial.println(err.c_str());
+
+    if (!err) {
+      handleReq(doc);
+    }
+
+    pendingMsg = ""; // optional: String freigeben
+  }
+
   delay(10);
 }
