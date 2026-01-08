@@ -6,11 +6,11 @@
 #include "cert.h"
 #include <PubSubClient.h>
 
-const char* MQTT_SERVER = "broker.hivemq.com";
-const uint16_t MQTT_PORT = 1883;
-const char* MQTT_TOPIC_SUB = "demo/home/lamp1/cmd";
+const char* MQTT_SERVER = "a5247c1ae5634398b09808b959fd47e9.s1.eu.hivemq.cloud";
+const uint16_t MQTT_PORT = 8883;
+const char* MQTT_TOPIC_SUB = "t/LeoTestID";
 
-WiFiClient espClient;
+WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 
 const char url[] = "https://jsonplaceholder.typicode.com/todos/1";
@@ -66,7 +66,8 @@ void setupMqtt()
     String clientId = "esp32-client-";
     clientId += String(WiFi.macAddress());
 
-    if (mqttClient.connect(clientId.c_str()))
+    // Use MQTT username/password from secrets.h
+    if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD))
     {
       Serial.println("verbunden");
       mqttClient.subscribe(MQTT_TOPIC_SUB);
@@ -187,6 +188,17 @@ void setup()
   }
   Serial.println("\nWLAN verbunden!");
   Serial.println(WiFi.localIP());
+
+  // Configure TLS for MQTT connection. If ROOT_CERT_HIVEMQ is empty,
+  // fall back to insecure connection (useful for quick testing only).
+  if (ROOT_CERT_HIVEMQ[0] != '\0') {
+    espClient.setCACert(ROOT_CERT_HIVEMQ);
+    Serial.println("MQTT: using certificate from cert.h");
+  } else {
+    espClient.setInsecure();
+    Serial.println("MQTT: WARNING - certificate verification DISABLED (setInsecure()).");
+  }
+
   setupMqtt();
   // pinMode(LED_BUILTIN, OUTPUT);
 }
